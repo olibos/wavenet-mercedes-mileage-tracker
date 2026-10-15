@@ -42,11 +42,13 @@ var config = new ConsumerConfig(new Dictionary<string, string>
 using var cts = new CancellationTokenSource();
 using var sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx =>
 {
+    Console.WriteLine($"[signal] {ctx.Signal} at {DateTimeOffset.UtcNow:O}");
     ctx.Cancel = true;
     cts.Cancel();
 });
 using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
 {
+    Console.WriteLine($"[signal] {ctx.Signal} at {DateTimeOffset.UtcNow:O}");
     ctx.Cancel = true;
     cts.Cancel();
 });
@@ -85,35 +87,47 @@ const string upsertSql =
         INSERT (VIN, SensorName, OriginalName, Value, Source, EventDate)
         VALUES (source.VIN, source.SensorName, source.OriginalName, source.Value, @Source, source.EventDate);
     """;
-while (!cts.IsCancellationRequested)
+try
 {
-    var content = consumer.Consume(cts.Token);
-    var message = content.Message.Value;
-    if (message is { Data.Signals.Count: > 0 })
+    while (!cts.IsCancellationRequested)
     {
-        var table = new DataTable();
-        table.Columns.Add("SensorName", typeof(string));
-        table.Columns.Add("OriginalName", typeof(string));
-        table.Columns.Add("Value", typeof(string));
-        table.Columns.Add("EventDate", typeof(DateTime));
-
-        foreach (var group in message.Data.Signals.GroupBy(s => knownSensors.GetValueOrDefault(s.Name, s.Name)))
+        var content = consumer.Consume(cts.Token);
+        var message = content.Message.Value;
+        if (message is { Data.Signals.Count: > 0 })
         {
-            var latest = group.MaxBy(s => s.Timestamp)!;
-            table.Rows.Add(group.Key, latest.Name, latest.Value, latest.Timestamp.UtcDateTime);
+            var table = new DataTable();
+            table.Columns.Add("SensorName", typeof(string));
+            table.Columns.Add("OriginalName", typeof(string));
+            table.Columns.Add("Value", typeof(string));
+            table.Columns.Add("EventDate", typeof(DateTime));
+
+            foreach (var group in message.Data.Signals.GroupBy(s => knownSensors.GetValueOrDefault(s.Name, s.Name)))
+            {
+                var latest = group.MaxBy(s => s.Timestamp)!;
+                table.Rows.Add(group.Key, latest.Name, latest.Value, latest.Timestamp.UtcDateTime);
+            }
+
+            await using var connection = new SqlConnection(connectionString);
+            await using var command = new SqlCommand(upsertSql, connection);
+
+            command.Parameters.Add("@VIN", SqlDbType.Char, 17).Value = message.Vin;
+            command.Parameters.Add("@Source", SqlDbType.VarChar, 30).Value = "Mercedes";
+            var signals = command.Parameters.Add("@Signals", SqlDbType.Structured);
+            signals.TypeName = "dbo.VehicleSensorValueType";
+            signals.Value = table;
+
+            await connection.OpenAsync(cts.Token);
+            await command.ExecuteNonQueryAsync(cts.Token);
         }
-        await using var connection = new SqlConnection(connectionString);
-        await using var command = new SqlCommand(upsertSql, connection);
 
-        command.Parameters.Add("@VIN", SqlDbType.Char, 17).Value = message.Vin;
-        command.Parameters.Add("@Source", SqlDbType.VarChar, 30).Value = "Mercedes";
-        var signals = command.Parameters.Add("@Signals", SqlDbType.Structured);
-        signals.TypeName = "dbo.VehicleSensorValueType";
-        signals.Value = table;
-
-        await connection.OpenAsync(cts.Token);
-        await command.ExecuteNonQueryAsync(cts.Token);
+        consumer.Commit(content);
     }
-
-    consumer.Commit(content);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("[shutdown] cancellation requested");
+}
+finally
+{
+    consumer.Close();
 }
