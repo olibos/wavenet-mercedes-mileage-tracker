@@ -116,5 +116,4 @@ while (!cts.IsCancellationRequested)
     }
 
     consumer.Commit(content);
-    return;
 }
